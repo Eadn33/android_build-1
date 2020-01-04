@@ -826,6 +826,461 @@ ifdef is_sdk_build
   target_gnu_MODULES := $(filter-out $(TARGET_OUT_EXECUTABLES)/%,$(target_gnu_MODULES))
   $(info Removing from sdk:)$(foreach d,$(target_gnu_MODULES),$(info : $(d)))
   modules_to_install := \
+ADDITIONAL_BUILD_PROPERTIES += dalvik.vm.isa.$(TARGET_ARCH).variant=$(DEX2OAT_TARGET_CPU_VARIANT)
+ifneq ($(DEX2OAT_TARGET_INSTRUCTION_SET_FEATURES),)
+  ADDITIONAL_BUILD_PROPERTIES += dalvik.vm.isa.$(TARGET_ARCH).features=$(DEX2OAT_TARGET_INSTRUCTION_SET_FEATURES)
+endif
+
+ifdef TARGET_2ND_ARCH
+  ADDITIONAL_BUILD_PROPERTIES += dalvik.vm.isa.$(TARGET_2ND_ARCH).variant=$($(TARGET_2ND_ARCH_VAR_PREFIX)DEX2OAT_TARGET_CPU_VARIANT)
+  ifneq ($($(TARGET_2ND_ARCH_VAR_PREFIX)DEX2OAT_TARGET_INSTRUCTION_SET_FEATURES),)
+    ADDITIONAL_BUILD_PROPERTIES += dalvik.vm.isa.$(TARGET_2ND_ARCH).features=$($(TARGET_2ND_ARCH_VAR_PREFIX)DEX2OAT_TARGET_INSTRUCTION_SET_FEATURES)
+  endif
+endif
+
+## user/userdebug ##
+
+user_variant := $(filter user userdebug,$(TARGET_BUILD_VARIANT))
+enable_target_debugging := true
+tags_to_install :=
+ifneq (,$(user_variant))
+  # Target is secure in user builds.
+  ADDITIONAL_DEFAULT_PROPERTIES += ro.secure=1
+  ADDITIONAL_DEFAULT_PROPERTIES += security.perf_harden=1
+
+  ifeq ($(user_variant),user)
+    ADDITIONAL_DEFAULT_PROPERTIES += ro.adb.secure=1
+  endif
+
+  ifeq ($(user_variant),userdebug)
+    # Pick up some extra useful tools
+    tags_to_install += debug
+  else
+    # Disable debugging in plain user builds.
+    enable_target_debugging :=
+  endif
+
+  # Disallow mock locations by default for user builds
+  ADDITIONAL_DEFAULT_PROPERTIES += ro.allow.mock.location=0
+
+else # !user_variant
+  # Turn on checkjni for non-user builds.
+  ADDITIONAL_BUILD_PROPERTIES += ro.kernel.android.checkjni=1
+  # Set device insecure for non-user builds.
+  ADDITIONAL_DEFAULT_PROPERTIES += ro.secure=0
+  # Allow mock locations by default for non user builds
+  ADDITIONAL_DEFAULT_PROPERTIES += ro.allow.mock.location=1
+endif # !user_variant
+
+ifeq (true,$(strip $(enable_target_debugging)))
+  # Target is more debuggable and adbd is on by default
+  ADDITIONAL_DEFAULT_PROPERTIES += ro.debuggable=1
+  # Enable Dalvik lock contention logging.
+  ADDITIONAL_BUILD_PROPERTIES += dalvik.vm.lockprof.threshold=500
+  # Include the debugging/testing OTA keys in this build.
+  INCLUDE_TEST_OTA_KEYS := true
+else # !enable_target_debugging
+  # Target is less debuggable and adbd is off by default
+  ADDITIONAL_DEFAULT_PROPERTIES += ro.debuggable=0
+endif # !enable_target_debugging
+
+## eng ##
+
+ifeq ($(TARGET_BUILD_VARIANT),eng)
+tags_to_install := debug eng
+ifneq ($(filter ro.setupwizard.mode=ENABLED, $(call collapse-pairs, $(ADDITIONAL_BUILD_PROPERTIES))),)
+  # Don't require the setup wizard on eng builds
+  ADDITIONAL_BUILD_PROPERTIES := $(filter-out ro.setupwizard.mode=%,\
+          $(call collapse-pairs, $(ADDITIONAL_BUILD_PROPERTIES))) \
+          ro.setupwizard.mode=OPTIONAL
+endif
+ifndef is_sdk_build
+  # To speedup startup of non-preopted builds, don't verify or compile the boot image.
+  ADDITIONAL_BUILD_PROPERTIES += dalvik.vm.image-dex2oat-filter=verify-at-runtime
+endif
+endif
+
+## sdk ##
+
+ifdef is_sdk_build
+
+# Detect if we want to build a repository for the SDK
+sdk_repo_goal := $(strip $(filter sdk_repo,$(MAKECMDGOALS)))
+MAKECMDGOALS := $(strip $(filter-out sdk_repo,$(MAKECMDGOALS)))
+
+ifneq ($(words $(sort $(filter-out $(INTERNAL_MODIFIER_TARGETS) checkbuild emulator_tests target-files-package,$(MAKECMDGOALS)))),1)
+$(error The 'sdk' target may not be specified with any other targets)
+endif
+
+# TODO: this should be eng I think.  Since the sdk is built from the eng
+# variant.
+tags_to_install := debug eng
+ADDITIONAL_BUILD_PROPERTIES += xmpp.auto-presence=true
+ADDITIONAL_BUILD_PROPERTIES += ro.config.nocheckin=yes
+else # !sdk
+endif
+
+BUILD_WITHOUT_PV := true
+
+ADDITIONAL_BUILD_PROPERTIES += net.bt.name=Android
+
+# enable vm tracing in files for now to help track
+# the cause of ANRs in the content process
+ADDITIONAL_BUILD_PROPERTIES += dalvik.vm.stack-trace-file=/data/anr/traces.txt
+
+# ------------------------------------------------------------
+# Define a function that, given a list of module tags, returns
+# non-empty if that module should be installed in /system.
+
+# For most goals, anything not tagged with the "tests" tag should
+# be installed in /system.
+define should-install-to-system
+$(if $(filter tests,$(1)),,true)
+endef
+
+ifdef is_sdk_build
+# For the sdk goal, anything with the "samples" tag should be
+# installed in /data even if that module also has "eng"/"debug"/"user".
+define should-install-to-system
+$(if $(filter samples tests,$(1)),,true)
+endef
+endif
+
+
+# If they only used the modifier goals (showcommands, etc), we'll actually
+# build the default target.
+ifeq ($(filter-out $(INTERNAL_MODIFIER_TARGETS),$(MAKECMDGOALS)),)
+.PHONY: $(INTERNAL_MODIFIER_TARGETS)
+$(INTERNAL_MODIFIER_TARGETS): $(DEFAULT_GOAL)
+endif
+
+#
+# Typical build; include any Android.mk files we can find.
+#
+subdirs := $(TOP)
+
+FULL_BUILD := true
+
+# Before we go and include all of the module makefiles, stash away
+# the PRODUCT_* values so that later we can verify they are not modified.
+stash_product_vars:=true
+ifeq ($(stash_product_vars),true)
+  $(call stash-product-vars, __STASHED)
+endif
+
+ifneq ($(ONE_SHOT_MAKEFILE),)
+# We've probably been invoked by the "mm" shell function
+# with a subdirectory's makefile.
+include $(ONE_SHOT_MAKEFILE)
+# Change CUSTOM_MODULES to include only modules that were
+# defined by this makefile; this will install all of those
+# modules as a side-effect.  Do this after including ONE_SHOT_MAKEFILE
+# so that the modules will be installed in the same place they
+# would have been with a normal make.
+CUSTOM_MODULES := $(sort $(call get-tagged-modules,$(ALL_MODULE_TAGS)))
+FULL_BUILD :=
+# Stub out the notice targets, which probably aren't defined
+# when using ONE_SHOT_MAKEFILE.
+NOTICE-HOST-%: ;
+NOTICE-TARGET-%: ;
+
+# A helper goal printing out install paths
+.PHONY: GET-INSTALL-PATH
+GET-INSTALL-PATH:
+	@echo "Install paths for modules in $(ONE_SHOT_MAKEFILE):"
+	@$(foreach m, $(ALL_MODULES), $(if $(ALL_MODULES.$(m).INSTALLED), \
+		echo 'INSTALL-PATH: $(m) $(ALL_MODULES.$(m).INSTALLED)';))
+
+else # ONE_SHOT_MAKEFILE
+
+ifneq ($(dont_bother),true)
+#
+# Include all of the makefiles in the system
+#
+
+# Can't use first-makefiles-under here because
+# --mindepth=2 makes the prunes not work.
+subdir_makefiles := \
+	$(shell build/tools/findleaves.py $(FIND_LEAVES_EXCLUDES) $(subdirs) Android.mk)
+
+ifeq ($(USE_SOONG),true)
+subdir_makefiles := $(SOONG_ANDROID_MK) $(call filter-soong-makefiles,$(subdir_makefiles))
+endif
+
+$(foreach mk, $(subdir_makefiles),$(info including $(mk) ...)$(eval include $(mk)))
+
+ifdef PDK_FUSION_PLATFORM_ZIP
+# Bring in the PDK platform.zip modules.
+include $(BUILD_SYSTEM)/pdk_fusion_modules.mk
+endif # PDK_FUSION_PLATFORM_ZIP
+
+endif # dont_bother
+
+endif # ONE_SHOT_MAKEFILE
+
+# Now with all Android.mks loaded we can do post cleaning steps.
+include $(BUILD_SYSTEM)/post_clean.mk
+
+ifeq ($(stash_product_vars),true)
+  $(call assert-product-vars, __STASHED)
+endif
+
+include $(BUILD_SYSTEM)/legacy_prebuilts.mk
+ifneq ($(filter-out $(GRANDFATHERED_ALL_PREBUILT),$(strip $(notdir $(ALL_PREBUILT)))),)
+  $(warning *** Some files have been added to ALL_PREBUILT.)
+  $(warning *)
+  $(warning * ALL_PREBUILT is a deprecated mechanism that)
+  $(warning * should not be used for new files.)
+  $(warning * As an alternative, use PRODUCT_COPY_FILES in)
+  $(warning * the appropriate product definition.)
+  $(warning * build/target/product/core.mk is the product)
+  $(warning * definition used in all products.)
+  $(warning *)
+  $(foreach bad_prebuilt,$(filter-out $(GRANDFATHERED_ALL_PREBUILT),$(strip $(notdir $(ALL_PREBUILT)))),$(warning * unexpected $(bad_prebuilt) in ALL_PREBUILT))
+  $(warning *)
+  $(error ALL_PREBUILT contains unexpected files)
+endif
+
+# -------------------------------------------------------------------
+# All module makefiles have been included at this point.
+# -------------------------------------------------------------------
+
+
+# -------------------------------------------------------------------
+# Fix up CUSTOM_MODULES to refer to installed files rather than
+# just bare module names.  Leave unknown modules alone in case
+# they're actually full paths to a particular file.
+known_custom_modules := $(filter $(ALL_MODULES),$(CUSTOM_MODULES))
+unknown_custom_modules := $(filter-out $(ALL_MODULES),$(CUSTOM_MODULES))
+CUSTOM_MODULES := \
+	$(call module-installed-files,$(known_custom_modules)) \
+	$(unknown_custom_modules)
+
+# -------------------------------------------------------------------
+# Define dependencies for modules that require other modules.
+# This can only happen now, after we've read in all module makefiles.
+#
+# TODO: deal with the fact that a bare module name isn't
+# unambiguous enough.  Maybe declare short targets like
+# APPS:Quake or HOST:SHARED_LIBRARIES:libutils.
+# BUG: the system image won't know to depend on modules that are
+# brought in as requirements of other modules.
+#
+# Resolve the required module name to 32-bit or 64-bit variant.
+# Get a list of corresponding 32-bit module names, if one exists.
+define get-32-bit-modules
+$(strip $(foreach m,$(1),\
+  $(if $(ALL_MODULES.$(m)$(TARGET_2ND_ARCH_MODULE_SUFFIX).CLASS),\
+    $(m)$(TARGET_2ND_ARCH_MODULE_SUFFIX))))
+endef
+# Get a list of corresponding 32-bit module names, if one exists;
+# otherwise return the original module name
+define get-32-bit-modules-if-we-can
+$(strip $(foreach m,$(1),\
+  $(if $(ALL_MODULES.$(m)$(TARGET_2ND_ARCH_MODULE_SUFFIX).CLASS),\
+    $(m)$(TARGET_2ND_ARCH_MODULE_SUFFIX),
+    $(m))))
+endef
+
+# If a module is for a cross host os, the required modules must be for
+# that OS too.
+# If a module is built for 32-bit, the required modules must be 32-bit too;
+# Otherwise if the module is an exectuable or shared library,
+#   the required modules must be 64-bit;
+#   otherwise we require both 64-bit and 32-bit variant, if one exists.
+$(foreach m,$(ALL_MODULES),\
+  $(eval r := $(ALL_MODULES.$(m).REQUIRED))\
+  $(if $(r),\
+    $(if $(ALL_MODULES.$(m).FOR_HOST_CROSS),\
+      $(eval r := $(addprefix host_cross_,$(r))))\
+    $(if $(ALL_MODULES.$(m).FOR_2ND_ARCH),\
+      $(eval r_r := $(call get-32-bit-modules-if-we-can,$(r))),\
+      $(if $(filter EXECUTABLES SHARED_LIBRARIES,$(ALL_MODULES.$(m).CLASS)),\
+        $(eval r_r := $(r)),\
+        $(eval r_r := $(r) $(call get-32-bit-modules,$(r)))\
+       )\
+     )\
+     $(eval ALL_MODULES.$(m).REQUIRED := $(strip $(r_r)))\
+  )\
+)
+r_r :=
+
+define add-required-deps
+$(1): | $(2)
+endef
+
+$(foreach m,$(ALL_MODULES), \
+  $(eval r := $(ALL_MODULES.$(m).REQUIRED)) \
+  $(if $(r), \
+    $(eval r := $(call module-installed-files,$(r))) \
+    $(eval t_m := $(filter $(TARGET_OUT_ROOT)/%, $(ALL_MODULES.$(m).INSTALLED))) \
+    $(eval h_m := $(filter $(HOST_OUT_ROOT)/%, $(ALL_MODULES.$(m).INSTALLED))) \
+    $(eval hc_m := $(filter $(HOST_CROSS_OUT_ROOT)/%, $(ALL_MODULES.$(m).INSTALLED))) \
+    $(eval t_r := $(filter $(TARGET_OUT_ROOT)/%, $(r))) \
+    $(eval h_r := $(filter $(HOST_OUT_ROOT)/%, $(r))) \
+    $(eval hc_r := $(filter $(HOST_CROSS_OUT_ROOT)/%, $(r))) \
+    $(eval t_m := $(filter-out $(t_r), $(t_m))) \
+    $(eval h_m := $(filter-out $(h_r), $(h_m))) \
+    $(eval hc_m := $(filter-out $(hc_r), $(hc_m))) \
+    $(if $(t_m), $(eval $(call add-required-deps, $(t_m),$(t_r)))) \
+    $(if $(h_m), $(eval $(call add-required-deps, $(h_m),$(h_r)))) \
+    $(if $(hc_m), $(eval $(call add-required-deps, $(hc_m),$(hc_r)))) \
+   ) \
+ )
+
+t_m :=
+h_m :=
+hc_m :=
+t_r :=
+h_r :=
+hc_r :=
+
+# Establish the dependecies on the shared libraries.
+# It also adds the shared library module names to ALL_MODULES.$(m).REQUIRED,
+# so they can be expanded to product_MODULES later.
+# $(1): TARGET_ or HOST_ or HOST_CROSS_.
+# $(2): non-empty for 2nd arch.
+# $(3): non-empty for host cross compile.
+define resolve-shared-libs-depes
+$(foreach m,$($(if $(2),$($(1)2ND_ARCH_VAR_PREFIX))$(1)DEPENDENCIES_ON_SHARED_LIBRARIES),\
+  $(eval p := $(subst :,$(space),$(m)))\
+  $(eval mod := $(firstword $(p)))\
+  $(eval deps := $(subst $(comma),$(space),$(lastword $(p))))\
+  $(if $(2),$(eval deps := $(addsuffix $($(1)2ND_ARCH_MODULE_SUFFIX),$(deps))))\
+  $(if $(3),$(eval deps := $(addprefix host_cross_,$(deps))))\
+  $(eval r := $(filter $($(1)OUT)/%,$(call module-installed-files,\
+    $(deps))))\
+  $(eval $(call add-required-deps,$(word 2,$(p)),$(r)))\
+  $(eval ALL_MODULES.$(mod).REQUIRED += $(deps)))
+endef
+
+$(call resolve-shared-libs-depes,TARGET_)
+ifdef TARGET_2ND_ARCH
+$(call resolve-shared-libs-depes,TARGET_,true)
+endif
+$(call resolve-shared-libs-depes,HOST_)
+ifdef HOST_2ND_ARCH
+$(call resolve-shared-libs-depes,HOST_,true)
+endif
+ifdef HOST_CROSS_OS
+$(call resolve-shared-libs-depes,HOST_CROSS_,,true)
+endif
+
+m :=
+r :=
+p :=
+deps :=
+add-required-deps :=
+
+# -------------------------------------------------------------------
+# Figure out our module sets.
+#
+# Of the modules defined by the component makefiles,
+# determine what we actually want to build.
+
+###########################################################
+## Expand a module name list with REQUIRED modules
+###########################################################
+# $(1): The variable name that holds the initial module name list.
+#       the variable will be modified to hold the expanded results.
+# $(2): The initial module name list.
+# Returns empty string (maybe with some whitespaces).
+define expand-required-modules
+$(eval _erm_new_modules := $(sort $(filter-out $($(1)),\
+  $(foreach m,$(2),$(ALL_MODULES.$(m).REQUIRED)))))\
+$(if $(_erm_new_modules),$(eval $(1) += $(_erm_new_modules))\
+  $(call expand-required-modules,$(1),$(_erm_new_modules)))
+endef
+
+ifdef FULL_BUILD
+  # The base list of modules to build for this product is specified
+  # by the appropriate product definition file, which was included
+  # by product_config.mk.
+  product_MODULES := $(PRODUCTS.$(INTERNAL_PRODUCT).PRODUCT_PACKAGES)
+  # Filter out the overridden packages before doing expansion
+  product_MODULES := $(filter-out $(foreach p, $(product_MODULES), \
+      $(PACKAGES.$(p).OVERRIDES)), $(product_MODULES))
+
+  # Resolve the :32 :64 module name
+  modules_32 := $(patsubst %:32,%,$(filter %:32, $(product_MODULES)))
+  modules_64 := $(patsubst %:64,%,$(filter %:64, $(product_MODULES)))
+  modules_rest := $(filter-out %:32 %:64,$(product_MODULES))
+  # Note for 32-bit product, $(modules_32) and $(modules_64) will be
+  # added as their original module names.
+  product_MODULES := $(call get-32-bit-modules-if-we-can, $(modules_32))
+  product_MODULES += $(modules_64)
+  # For the rest we add both
+  product_MODULES += $(call get-32-bit-modules, $(modules_rest))
+  product_MODULES += $(modules_rest)
+
+  $(call expand-required-modules,product_MODULES,$(product_MODULES))
+
+  product_FILES := $(call module-installed-files, $(product_MODULES))
+  ifeq (0,1)
+    $(info product_FILES for $(TARGET_DEVICE) ($(INTERNAL_PRODUCT)):)
+    $(foreach p,$(product_FILES),$(info :   $(p)))
+    $(error done)
+  endif
+else
+  # We're not doing a full build, and are probably only including
+  # a subset of the module makefiles.  Don't try to build any modules
+  # requested by the product, because we probably won't have rules
+  # to build them.
+  product_FILES :=
+endif
+
+eng_MODULES := $(sort \
+        $(call get-tagged-modules,eng) \
+        $(call module-installed-files, $(PRODUCTS.$(INTERNAL_PRODUCT).PRODUCT_PACKAGES_ENG)) \
+    )
+debug_MODULES := $(sort \
+        $(call get-tagged-modules,debug) \
+        $(call module-installed-files, $(PRODUCTS.$(INTERNAL_PRODUCT).PRODUCT_PACKAGES_DEBUG)) \
+    )
+tests_MODULES := $(sort \
+        $(call get-tagged-modules,tests) \
+        $(call module-installed-files, $(PRODUCTS.$(INTERNAL_PRODUCT).PRODUCT_PACKAGES_TESTS)) \
+    )
+
+# TODO: Remove the 3 places in the tree that use ALL_DEFAULT_INSTALLED_MODULES
+# and get rid of it from this list.
+modules_to_install := $(sort \
+    $(ALL_DEFAULT_INSTALLED_MODULES) \
+    $(product_FILES) \
+    $(foreach tag,$(tags_to_install),$($(tag)_MODULES)) \
+    $(CUSTOM_MODULES) \
+  )
+
+# Some packages may override others using LOCAL_OVERRIDES_PACKAGES.
+# Filter out (do not install) any overridden packages.
+overridden_packages := $(call get-package-overrides,$(modules_to_install))
+ifdef overridden_packages
+#  old_modules_to_install := $(modules_to_install)
+  modules_to_install := \
+      $(filter-out $(foreach p,$(overridden_packages),$(p) %/$(p).apk %/$(p).odex), \
+          $(modules_to_install))
+endif
+#$(error filtered out
+#           $(filter-out $(modules_to_install),$(old_modules_to_install)))
+
+# Don't include any GNU General Public License shared objects or static
+# libraries in SDK images.  GPL executables (not static/dynamic libraries)
+# are okay if they don't link against any closed source libraries (directly
+# or indirectly)
+
+# It's ok (and necessary) to build the host tools, but nothing that's
+# going to be installed on the target (including static libraries).
+
+ifdef is_sdk_build
+  target_gnu_MODULES := \
+              $(filter \
+                      $(TARGET_OUT_INTERMEDIATES)/% \
+                      $(TARGET_OUT)/% \
+                      $(TARGET_OUT_DATA)/%, \
+                              $(sort $(call get-tagged-modules,gnu)))
+  target_gnu_MODULES := $(filter-out $(TARGET_OUT_EXECUTABLES)/%,$(target_gnu_MODULES))
+  $(info Removing from sdk:)$(foreach d,$(target_gnu_MODULES),$(info : $(d)))
+  modules_to_install := \
               $(filter-out $(target_gnu_MODULES),$(modules_to_install))
 
   # Ensure every module listed in PRODUCT_PACKAGES* gets something installed
@@ -1112,7 +1567,7 @@ findbugs: $(INTERNAL_FINDBUGS_HTML_TARGET) $(INTERNAL_FINDBUGS_XML_TARGET)
 
 .PHONY: clean
 clean:
-	@rm -rf $(OUT_DIR)/* $(OUT_DIR)/..?* $(OUT_DIR)/.[!.]*
+	@rm -rf $(OUT_DIR)/*
 	@echo "Entire build directory removed."
 
 .PHONY: clobber
